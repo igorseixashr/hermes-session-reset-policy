@@ -721,3 +721,85 @@ def test_policy_reader_resolves_profiles_from_root(plugin, tmp_path, monkeypatch
         assert policy == {"mode": "idle", "idle_minutes": minutes}, (
             f"HERMES_HOME={home} profile={profile!r} -> {policy}"
         )
+
+
+# ---------------------------------------------------------------------------
+# session_reset.handoff — the opt-in compaction handoff
+# ---------------------------------------------------------------------------
+
+_HANDOFF_POLICY = {"mode": "idle", "idle_minutes": 60, "handoff": True}
+
+
+def _handoff_event(text: str):
+    return SimpleNamespace(source=_real_source(), internal=False, text=text)
+
+
+def test_handoff_absent_or_falsy_is_off(plugin):
+    """Default off: an untouched policy must never rewrite the message."""
+    for policy in ({"mode": "idle", "idle_minutes": 60},
+                   {"mode": "idle", "idle_minutes": 60, "handoff": False},
+                   {"mode": "idle", "idle_minutes": 60, "handoff": None}):
+        assert plugin._handoff_result(policy, _handoff_event("oi"), "s-1", "idle") is None
+
+
+def test_handoff_note_copies_no_transcript_only_the_brief(plugin):
+    """The note is a prompt, not a summary: the 6 fields, the pointer, the
+    reason and the outgoing session id — and the user's message kept verbatim."""
+    result = plugin._handoff_result(_HANDOFF_POLICY, _handoff_event("segue o chamado 123"), "seed-sid", "idle")
+
+    assert result is not None and result["action"] == "rewrite"
+    text = result["text"]
+    for field in ("Task verbatim", "Established facts", "Applied changes",
+                  "Verification", "Dead ends", "Remaining plan"):
+        assert field in text
+    assert 'session_search(session_id="seed-sid")' in text
+    assert "reason: idle" in text
+    # No transcript content, and the triggering message survives intact at the end.
+    assert text.endswith("segue o chamado 123")
+
+
+def test_handoff_never_rewrites_commands_or_empty_messages(plugin):
+    """Rewriting a command's text would break command parsing downstream."""
+    for text in ("/status", "  /new topico", "", "   "):
+        assert plugin._handoff_result(_HANDOFF_POLICY, _handoff_event(text), "s-1", "idle") is None
+
+
+def test_handoff_rewrite_failure_degrades_to_normal_dispatch(plugin):
+    """A junk policy value must not raise out of the hook."""
+    assert plugin._handoff_result({"handoff": "yes", "mode": "idle"}, object(), "s-1", "idle") is None
+
+
+def test_maybe_reset_returns_handoff_rewrite_for_the_fresh_session(plugin, tmp_path):
+    """End to end: past the boundary with handoff on, the hook resets AND hands
+    the fresh conversation the brief — naming the session that just ended."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120)
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = _handoff_event("continua de onde parou")
+
+    async def fake_reset(_gateway, _event, _source, _store, _key):
+        return SimpleNamespace(session_id="fresh-sid")
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_HANDOFF_POLICY), \
+         mock.patch.object(plugin, "_reset_session", new=fake_reset):
+        result = _run(plugin._maybe_reset(event, gateway, store))
+
+    assert result is not None and result["action"] == "rewrite"
+    assert 'session_search(session_id="seed-sid")' in result["text"]
+    assert result["text"].endswith("continua de onde parou")
+
+
+def test_maybe_reset_without_handoff_still_allows_normal_dispatch(plugin, tmp_path):
+    """Regression guard: the default off path keeps returning None (allow)."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120)
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = _handoff_event("continua de onde parou")
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    async def fake_reset(_gateway, _event, _source, _store, _key):
+        return SimpleNamespace(session_id="fresh-sid")
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy), \
+         mock.patch.object(plugin, "_reset_session", new=fake_reset):
+        assert _run(plugin._maybe_reset(event, gateway, store)) is None

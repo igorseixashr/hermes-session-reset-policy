@@ -83,6 +83,16 @@ Compatibility notes
   agent does not receive the auto-reset context note or channel-continuity
   hint that the old core patch produced. First-turn topic/channel skill
   re-injection DOES apply (``is_fresh_reset`` is set by ``reset_session``).
+- ``session_reset.handoff: true`` (default off) closes that gap from the plugin
+  side: the message that triggered the reset is rewritten (the
+  ``pre_gateway_dispatch`` ``rewrite`` action) to carry a 6-field compaction
+  handoff prompt — task verbatim, established facts, applied changes,
+  verification, dead ends, remaining plan — plus a pointer to the outgoing
+  transcript, so the fresh conversation rebuilds its brief on demand from
+  stored history instead of asking the user to repeat context. The rewrite is
+  skipped for command messages (their text must stay parseable) and for
+  boundary triggers with no prior user activity; every failure degrades to
+  normal dispatch.
 """
 
 from __future__ import annotations
@@ -96,7 +106,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 _META_KEY = "srp_last_user_inbound"
 
@@ -197,6 +207,56 @@ def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: da
     except Exception:
         logger.debug("session_reset boundary evaluation failed; skipping", exc_info=True)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Opt-in reset handoff (``session_reset.handoff``, default off)
+#
+# The reset is an explicit-style boundary: the fresh conversation starts with
+# no context at all, and (unlike core's auto-reset path) nothing tells the
+# agent that a previous conversation exists. This note restores continuity the
+# cheap way — the raw transcript stays OUT of context (it is already stored and
+# searchable) while the model is told to rebuild a compact 6-field brief from
+# it on demand. No extra LLM call, no transcript copy, no secret expansion.
+# ---------------------------------------------------------------------------
+
+_HANDOFF_TEMPLATE = """[Session handoff — automatic note from the session-reset policy]
+
+This chat's previous conversation was closed by policy (reason: {reason}; previous session id: {old_sid}) and is NOT in your context. Nothing was lost: its transcript is stored and retrievable.
+
+Before answering the message at the end of this note, rebuild the working brief from that previous session as a 6-field COMPACTION (not a narrative summary), and keep it internal unless the user asks for a recap:
+1. Task verbatim — the user's last unfulfilled request, word for word.
+2. Established facts — settled decisions, IDs, paths, values, findings.
+3. Applied changes — what was already done, and whether it was verified.
+4. Verification — how each change was confirmed (command/evidence), or that it was not.
+5. Dead ends — approaches that failed, and why (do not retry them).
+6. Remaining plan + next command — the immediate next action.
+
+Recover the content on demand with session_search(session_id="{old_sid}") — or /resume to browse and restore that conversation. Read only what the task needs; never copy API keys, tokens, passwords or other credentials into this conversation (use [REDACTED]). If the brief cannot be recovered, say so and ask only for what is missing — never ask the user to repeat context that is already in the stored transcript."""
+
+
+def _handoff_result(policy: Dict[str, Any], event: Any, old_sid: Optional[str],
+                    reason: Optional[str]) -> Optional[Dict[str, str]]:
+    """The ``rewrite`` payload carrying the handoff note, or None.
+
+    Only when ``handoff`` is enabled in the ``session_reset`` block. Command
+    messages and empty text are never rewritten — replacing their text would
+    break command parsing downstream. Any failure returns None, i.e. the
+    message dispatches exactly as it would without the plugin.
+    """
+    try:
+        if not policy.get("handoff"):
+            return None
+        text = getattr(event, "text", None) or ""
+        if not text.strip() or text.lstrip().startswith("/"):
+            return None
+        note = _HANDOFF_TEMPLATE.format(reason=str(reason or "policy"),
+                                       old_sid=str(old_sid or "unknown"))
+        return {"action": "rewrite", "text": f"{note}\n\n---\n\n{text}"}
+    except Exception:
+        logger.debug("session-reset-policy: handoff note build failed; dispatching unchanged",
+                     exc_info=True)
+        return None
 
 
 def _session_in_flight(entry: Any) -> bool:
@@ -370,6 +430,7 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         )
         return None  # normal dispatch; the next message re-evaluates the same boundary
 
+    old_sid = getattr(entry, "session_id", None)
     try:
         new_entry = await _reset_session(gateway, event, source, session_store, key)
     except Exception:
@@ -383,7 +444,10 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         "session-reset-policy: reset %s (reason=%s, new session %s)",
         key, reason, new_sid,
     )
-    return None  # always allow normal dispatch; the fresh session picks the message up
+    # Opt-in handoff: the fresh session starts empty, so hand the triggering
+    # message a brief-rebuild prompt plus a pointer to the outgoing transcript.
+    # Always allow normal dispatch when the handoff is off (the default).
+    return _handoff_result(policy, event, old_sid, reason)
 
 
 def register(ctx: Any) -> None:

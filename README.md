@@ -65,10 +65,31 @@ session_reset:
   mode: both          # idle | daily | both | none
   idle_minutes: 60
   at_hour: 4          # local hour for the daily boundary
+  handoff: true       # optional (default false): carry continuity across the reset
 ```
 
 `mode: none` or an absent block disables the plugin entirely (no reset, no log
 noise).
+
+### `handoff` (default `false`)
+
+A policy reset is an explicit-style boundary, so the fresh conversation starts
+with no context — and nothing tells the agent that a previous conversation
+exists. With `handoff: true` the plugin rewrites the message that triggered the
+reset (the `pre_gateway_dispatch` `rewrite` action) to prepend a short
+compaction handoff note: a 6-field brief instruction (task verbatim, established
+facts, applied changes, verification, dead ends, remaining plan + next command)
+plus a pointer to the outgoing transcript via `session_search`/`/resume`.
+
+Design choices worth knowing:
+
+- The raw transcript is **not** copied into the prompt: it stays stored and is
+  retrieved on demand, so the boundary costs no extra LLM call and no tokens
+  beyond the note.
+- Commands (`/...`) and empty messages are never rewritten — replacing their
+  text would break command parsing. Those boundaries simply start fresh.
+- Any failure in the handoff path degrades to normal dispatch; the reset itself
+  is unaffected.
 
 ## Install
 
@@ -92,7 +113,8 @@ Restart the gateway afterwards.
   `is_fresh_reset`, so topic/channel-bound skills re-inject on the first turn —
   but it does **not** carry `was_auto_reset` bookkeeping, so the agent receives
   no "context was reset due to inactivity" sidecar note or channel-continuity
-  hint. Add your own guidance if you need the agent to know.
+  hint. Set `handoff: true` (see above) to hand the fresh conversation its
+  continuity brief, or add your own guidance.
 - A turn in flight is never reset; the clock is left untouched and the reset
   re-arms on the next message.
 - Boundary hooks keep firing downstream (`session:end`/`session:reset`,
